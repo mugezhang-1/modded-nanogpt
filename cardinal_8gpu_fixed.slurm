@@ -19,7 +19,7 @@ cd "/fs/ess/PAS2836/mugezhang/code/modded-nanogpt"
 # --- env (already built ahead of time) ---
 module load miniconda3/24.1.2-py310
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate torch124
+conda activate modded-nanogpt-test
 
 # --- comms / threading ---
 export OMP_NUM_THREADS=4

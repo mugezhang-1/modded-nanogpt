@@ -1,4 +1,11 @@
-fineweb10B/
-pylog124M/
 __pycache__/
-logs/
+*.py[cod]
+.venv/
+.env
+outputs/
+checkpoints/
+*.bin
+*.pt
+.DS_Store
+.idea/
+.vscode/

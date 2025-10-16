@@ -5,6 +5,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import time
 import copy
+import argparse
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -17,8 +18,10 @@ import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
-torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
-torch._dynamo.config.compiled_autograd = True
+
+# torch._inductor.config.coordinate_descent_tuning = True # we allow this flag for medium track
+# torch._dynamo.config.compiled_autograd = True
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -133,8 +136,9 @@ class Rotary(nn.Module):
         angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
-        self.sin = nn.Buffer(theta.sin(), persistent=False)
+        self.register_buffer("cos", theta.cos(), persistent=False)
+        self.register_buffer("sin", theta.sin(), persistent=False)
+
 
     def forward(self, x_BTHD: Tensor):
         assert self.cos.size(0) >= x_BTHD.size(-3)
@@ -160,20 +164,21 @@ class CausalSelfAttention(nn.Module):
         self.attn_scale = 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask, lambdas: Tensor):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
+        B, T = x.size(0), x.size(1)
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         q, k, v = F.linear(x, self.qkvo_w[:3].flatten(end_dim=1)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
         v = norm(v)
         if ve is not None:
-            v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = lambdas[0] * v + lambdas[1] * ve.view_as(v)
+        else:
             v = lambdas[0] * v
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
         y = F.linear(y, self.qkvo_w[3])
         return y
+
 
 class MLP(nn.Module):
     def __init__(self, dim: int):
@@ -346,20 +351,59 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 64*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    train_seq_len: int = 64*1024 # FlexAttention sequence length
+    val_seq_len: int = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5960 # number of iterations to run
-    cooldown_frac = 0.7 # fraction of training spent cooling down the learning rate
+    num_iterations: int = 5960 # number of iterations to run
+    cooldown_frac: float = 0.7 # fraction of training spent cooling down the learning rate
     # architecture
-    vocab_size = 50257
+    vocab_size: int = 50257
     # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint = False
+    val_loss_every: int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    save_checkpoint: bool = False
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train GPT model with custom datasets")
+    parser.add_argument("--train_files", type=str, default=None, 
+                        help="Pattern for training .bin files (e.g., 'data/my_data/data_train_*.bin')")
+    parser.add_argument("--val_files", type=str, default=None,
+                        help="Pattern for validation .bin files (e.g., 'data/my_data/data_val_*.bin')")
+    parser.add_argument("--vocab_size", type=int, default=None,
+                        help="Vocabulary size (must match your tokenizer)")
+    parser.add_argument("--val_tokens", type=int, default=None,
+                        help="Number of validation tokens to use")
+    parser.add_argument("--num_iterations", type=int, default=None,
+                        help="Number of training iterations")
+    parser.add_argument("--val_loss_every", type=int, default=None,
+                        help="Evaluate validation loss every N steps (0 for only at end)")
+    parser.add_argument("--save_checkpoint", action="store_true",
+                        help="Save model checkpoints")
+    parser.add_argument("--output_dir", type=str, default="logs",  # ADD THIS
+                        help="Directory to save checkpoints and logs")
+    return parser.parse_args()
+
+# Parse command line arguments
+cli_args = parse_args()
+
+# Initialize hyperparameters with defaults, override with CLI args if provided
 args = Hyperparameters()
+if cli_args.train_files is not None:
+    args.train_files = cli_args.train_files
+if cli_args.val_files is not None:
+    args.val_files = cli_args.val_files
+if cli_args.vocab_size is not None:
+    args.vocab_size = cli_args.vocab_size
+if cli_args.val_tokens is not None:
+    args.val_tokens = cli_args.val_tokens
+if cli_args.num_iterations is not None:
+    args.num_iterations = cli_args.num_iterations
+if cli_args.val_loss_every is not None:
+    args.val_loss_every = cli_args.val_loss_every
+if cli_args.save_checkpoint:
+    args.save_checkpoint = True
 
 run_id = int(os.environ.get("RUN_ID", 0))
 # torchrun sets these env variables
@@ -376,8 +420,9 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 # begin logging
 if master_process:
     run_id_full = f"{run_id:03d}_{uuid.uuid4()}"
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id_full}.txt"
+    output_dir = cli_args.output_dir if cli_args.output_dir else "logs"
+    os.makedirs(output_dir, exist_ok=True)
+    logfile = f"{output_dir}/{run_id_full}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -390,7 +435,8 @@ import torch._inductor.codecache # noqa: E402
 import torch._inductor.graph # noqa: E402
 def _patched_trace_structured(name, metadata_fn, **kwargs):
     if name == "inductor_output_code":
-        print0(f"inductor_output_code: {metadata_fn().get("filename", "Unknown")}")
+        fn = metadata_fn().get("filename", "Unknown")
+        print0(f"inductor_output_code: {fn}")
     trace_structured(name, metadata_fn, **kwargs)
 torch._inductor.codecache.trace_structured = _patched_trace_structured
 torch._inductor.graph.trace_structured = _patched_trace_structured
@@ -405,6 +451,16 @@ def nvidia_smi():
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
+print0("="*100)
+# Log the configuration
+print0(f"Configuration:")
+print0(f"  train_files: {args.train_files}")
+print0(f"  val_files: {args.val_files}")
+print0(f"  vocab_size: {args.vocab_size}")
+print0(f"  val_tokens: {args.val_tokens}")
+print0(f"  num_iterations: {args.num_iterations}")
+print0(f"  val_loss_every: {args.val_loss_every}")
+print0(f"  save_checkpoint: {args.save_checkpoint}")
 print0("="*100)
 
 ########################################
@@ -530,8 +586,8 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id_full}", exist_ok=True)
-            torch.save(log, f"logs/{run_id_full}/state_step{step:06d}.pt")
+            os.makedirs(f"{output_dir}/{run_id_full}", exist_ok=True)
+            torch.save(log, f"{output_dir}/{run_id_full}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
